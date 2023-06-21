@@ -1,0 +1,89 @@
+#!/bin/bash
+
+BATCH_CMDLINE=()
+TTYARG="-t"
+STDINARG="-i"
+NAMESPACEARG=""
+CNTARG=""
+
+function display_help() {
+
+cat <<EOM  >&2
+Usage: ${0} [<args>] <pod-name> [command to execute within container]
+
+Opens a shell or executes a command within a running pod.  Use 'kubectl get pods' to view running pods.
+
+EOM
+
+echo "Command line options:"
+# Parse per-argument help text ("ARG HELP: (arg): (description)" below) from our source code
+grep "## ARG HELP:" ${BASH_SOURCE[0]} | grep -v grep | sed -e 's/^.*ARG HELP: */  /' | while IFS=: read a b; do
+    c=$(echo $b | sed -e 's/^ *//')
+    printf "       %-18s     %s\\n" "$a" "$c" >&2
+done
+
+}
+
+function main() {
+
+    parse_arguments "$@"
+
+    if [ \! "$POD_NAME" ]; then
+	    ( echo "Usage: $0 <pod-name> [cmd]"; echo "       (if [cmd] is omitted, an interactive Bash shell is started)" ) 1>&2 && exit 1
+    fi
+
+    if ! kubectl get pod $POD_NAME > /dev/null 2>&1 ; then
+	    echo "Error: Pod \"$POD_NAME\" does not appear to exist. Run 'kubectl get pods' to list running pods." 1>&2 && exit 1
+    fi
+
+    INITENV=/opt/k8s-support/bin/initenv-createhomedir.sh
+
+    if [ -z "${BATCH_COMMAND[*]}" ]; then
+        BATCH_COMMAND=("/bin/bash")
+    fi
+
+    exec kubectl exec ${TTYARG} ${STDINARG} ${POD_NAME} ${CNTARG} -- ${INITENV} "${BATCH_COMMAND[@]}"
+}
+
+function parse_arguments() {
+    local OPTIND=1 OPTARG opt
+
+    while getopts "c:n:ITh" opt; do
+        case $opt in
+            n)  NAMESPACEARG="-n ${OPTARG}"
+                ;;
+            I)  ## ARG HELP:  -I: do not pipe stdin to command
+                STDINARG=""
+                ;;
+            T)  ## ARG HELP:  -T: do not assign TTY to command execution
+                TTYARG=""
+                ;;
+            c)  ## ARG HELP:  -c: specify non-default target container (default is usually correct)
+                CNTARG="-c ${OPTARG}"
+                ;;
+            h)  ## ARG HELP:  -h: Display usage instructions
+                display_help
+                exit 0
+                ;;
+            \?)
+                echo "Invalid option: -$OPTARG" >&2
+                exit 1
+                ;;
+            :)
+                echo "Option -$OPTARG requires an argument." >&2
+                exit 1
+                ;;
+        esac
+    done
+
+   if (( $# >= $OPTIND )); then
+        shift $(( $OPTIND -1 ))
+        POD_NAME=$1
+        shift 1
+
+        # If additional command line arguments supplied, treat as batch command
+        BATCH_COMMAND=("$@")
+   fi
+}
+
+main "$@"

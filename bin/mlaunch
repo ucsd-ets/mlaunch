@@ -1,0 +1,233 @@
+#!/bin/bash
+
+K8S_SVCACCT=/run/secrets/kubernetes.io/serviceaccount
+BATCH_CMDLINE=()
+JOB_NAME=()
+MODE="in_cluster"
+JOB_NAME=""
+JOB_TTL=10800 # 3 hours to retrieve pod logs/etc
+NUM_INSTANCES=1
+SVC_NAME=jobs
+DUMP=
+
+function display_help() {
+
+cat <<EOM  >&2
+Usage: ${0} [<args>] <container command> [args>
+
+Converts running pod/container (or pod definition provided by 'launch.sh') into a parallel Job.
+
+EOM
+
+echo "Command line options:"
+# Parse per-argument help text ("ARG HELP: (arg): (description)" below) from our source code
+grep "## ARG HELP:" ${BASH_SOURCE[0]} | grep -v grep | sed -e 's/^.*ARG HELP: */  /' | while IFS=: read a b; do
+    c=$(echo $b | sed -e 's/^ *//')
+    printf "       %-18s     %s\\n" "$a" "$c" >&2
+done
+
+}
+
+function main() {
+
+    parse_arguments "$@"
+
+    if [ -z "${BATCH_COMMAND[*]}" ]; then
+	    echo "$0: no job command specified" 1>&2
+        exit -1
+    fi
+
+    fetch_template
+
+    JOB_NAME=${JOB_NAME:-job-$$}
+	
+	JOB_CFG=$( cat <<EOM
+{
+"app": "batch/v1",
+"job_name": "$JOB_NAME",
+"ttl": $JOB_TTL,
+"count": $NUM_INSTANCES,
+"parallel": $NUM_INSTANCES,
+"app": "$SVC_NAME",
+"subdomain": "$SVC_NAME"
+}
+EOM
+)
+
+	load_cvt_job_jq
+
+    check_service
+
+	# "--args --" ensures the jq arg parser doesn't interpret the batch args
+    	# see https://github.com/stedolan/jq/pull/1989 re: documenting this behavior
+	JOB_JSON=$(echo "$TEMPLATE" | jq "$CVT_JOB_JQ" --argjson cfg "$JOB_CFG" --args -- "${BATCH_COMMAND[@]}")
+
+    if [ "$DUMP" = "yes" ]; then
+        echo "$JOB_JSON"
+        exit 0
+    elif echo "$JOB_JSON" | kubectl apply -f -; then
+        echo "Submitted: $JOB_NAME"
+        echo ""
+	    echo "View logs:             kubectl logs --prefix --timestamps -l job-name=$JOB_NAME"
+	    echo "List pods/containers:  kubectl get pods -l job-name=$JOB_NAME"
+	    echo "Shell into pod:        kubesh ${JOB_NAME}-1-abcde"
+	    echo "Terminate job:         kubectl delete job job-name=$JOB_NAME"
+    else
+	    echo "$0: job launch failed; 'kubectl describe job $JOB_NAME' may offer additional details." 1>&2
+        exit -1
+    fi
+
+}
+
+function check_service {
+    if !  kubectl get svc $SVC_NAME >  /dev/null 2>&1; then
+        kubectl apply -f - <<"EOM"
+{
+    "apiVersion": "v1",
+    "kind": "Service",
+    "metadata": { "name": "jobs" },
+    "spec": {
+        "clusterIP": "None",
+        "clusterIPs": [ "None" ],
+        "ports": [ { "port": 443, "protocol": "TCP", "targetPort": 443 } ],
+        "selector": { "app": "jobs" },
+        "sessionAffinity": "None",
+        "type": "ClusterIP"
+    }
+}
+EOM
+    fi
+}
+
+function fetch_template() {
+    if [ "$MODE" = "in_cluster" ]; then
+        if [ -d ${K8S_SVCACCT} ] && which kubectl 2>/dev/null 1>/dev/null; then
+	        TEMPLATE=$(kubectl get pod `hostname` -o json) # relies on podname=hostname local standard
+	        if [ $? != 0 ]; then
+		        echo "$0: unable to fetch pod matching current hostname $(hostname)" 1>&2
+		        exit -1
+	        fi
+        else
+		    echo "$0: unknown (non-cluster?) launch environment; use 'launch-... -d | $0 -s' to launch from login node." 1>&2
+		    exit -1
+        fi
+    else
+        TEMPLATE=$(cat -)
+    fi
+}
+
+
+function parse_arguments() {
+    local OPTIND=1 OPTARG opt
+
+    while getopts "S:N:n:p:hsd" opt; do
+        case $opt in
+            s)  # ARG HELP:   -s: accept pod template on standard input (default: duplicate host pod configuration)
+                MODE="stdin"
+                ;;
+            S)  # undocumented feature as most users can't cross namespace boundaries
+                NAMESPACEARG="-n ${OPTARG}"
+                ;;
+            N)  ## ARG HELP:  -N: specify job name (default: auto-generated)
+                JOB_NAME=${OPTARG}
+                ;;
+            n)  ## ARG HELP:  -n: number of iterations to be executed (default: 1)
+                NUM_INSTANCES=${OPTARG}
+                ;;
+            p)  ## ARG HELP:  -p: number of parallel instances (default: run all iterations simultaneously)
+                NUM_PARALLEL=${OPTARG}
+                ;;
+            d)  ## ARG HELP:  -d: dump kubernetes 'job' object to stdout
+                DUMP=yes
+                ;;
+            h)  ## ARG HELP:  -h: Display usage instructions
+                display_help
+                exit 0
+                ;;
+            \?)
+                echo "Invalid option: -$OPTARG" >&2
+                exit 1
+                ;;
+            :)
+                echo "Option -$OPTARG requires an argument." >&2
+                exit 1
+                ;;
+        esac
+    done
+
+   if (( $# >= $OPTIND )); then
+        shift $(( $OPTIND -1 ))
+
+        # If additional command line arguments supplied, treat as batch command
+        BATCH_COMMAND=("$@")
+   fi
+}
+
+
+function load_cvt_job_jq() {
+
+CVT_JOB_JQ=$( cat <<"EOM"
+# 0-based index of item in input array such that f is truthy, else null
+def which(f):
+  label $out
+  | foreach .[] as $x (-1; .+1; if ($x|f) then ., break $out else empty end)
+  // null ;
+
+# Would prefer a better solution here, e.g. parsing args/command
+def clean_container_command:
+    .command=[ "/opt/k8s-support/bin/tini-wrapper", "--", "/opt/k8s-support/bin/initenv-createhomedir.sh" ]
+    | .args=[]
+;
+
+def clean_spec_volumes:
+    .volumes |= map(select(.name | contains("kube-api-access") | not ))
+;
+
+def clean_container_volume_mounts:
+    .volumeMounts |= map(select(.name | contains("kube-api-access") | not ))
+;
+
+# $cfg passes as command-line argjson
+# { "job_name": "myjob", "ttl": 120, "count": 10, "parallel": 10, "subdomain": "qsub", "app": "qsub",
+#	"command": [ "bash", "-c", "echo $(date) $(hostname)" ] } as $cfg
+
+# Input is our template Pod (whether from inside the cluster, or as "launch.sh -d")
+. 
+| .metadata.labels |= ( (.+{"dsmlp/batch": "v0.1"}) | with_entries(select(.key|test("^dsmlp"))) ) 
+| .spec |= clean_spec_volumes
+| .spec |= del(.priority, .nodeName)
+| .spec.initContainers[] |= ( clean_container_volume_mounts )
+| .spec.containers[] |= ( clean_container_command | clean_container_volume_mounts )
+| .spec.containers[0].command |= ( . + $ARGS.positional )
+| del(.spec.securityContext.runAsGroup, .spec.securityContext.supplementalGroups)
+| {
+    apiVersion: "batch/v1",
+    kind: "Job",
+    metadata: {
+        labels: {
+	        app: $cfg.app
+        },
+        name: $cfg.job_name
+    },
+    spec: {
+	    ttlSecondsAfterFinished: $cfg.ttl,
+            backoffLimit: 0,
+            completionMode: "Indexed",
+            completions: $cfg.count,
+            parallelism: $cfg.parallel,
+            suspend: false,
+            template: {
+                "metadata": {
+                    "labels": (.metadata.labels + { "app": $cfg.app } )
+                },
+                "spec": ( .spec + { "subdomain": $cfg.subdomain } )
+            }
+    }
+} 
+EOM
+)
+
+}
+
+main "$@"
+
