@@ -120,21 +120,24 @@ function fetch_template() {
 function parse_arguments() {
     local OPTIND=1 OPTARG opt
 
-    while getopts "S:N:n:p:hsd" opt; do
+    while getopts "t:S:N:n:p:hsd" opt; do
         case $opt in
-            s)  # ARG HELP:   -s: accept pod template on standard input (default: duplicate host pod configuration)
+            s)  ## ARG HELP:  -s: accept pod template on standard input (default: duplicate host pod configuration)
+                MODE="stdin"
+                ;;
+            t)  ## ARG HELP:  -t <num>: preserve job logs/pods for <num> seconds (default: 10800)
                 MODE="stdin"
                 ;;
             S)  # undocumented feature as most users can't cross namespace boundaries
                 NAMESPACEARG="-n ${OPTARG}"
                 ;;
-            N)  ## ARG HELP:  -N: specify job name (default: auto-generated)
+            N)  ## ARG HELP:  -N <name>: specify job name (default: auto-generated)
                 JOB_NAME=${OPTARG}
                 ;;
-            n)  ## ARG HELP:  -n: number of iterations to be executed (default: 1)
+            n)  ## ARG HELP:  -n <num>:  number of iterations to be executed (default: 1)
                 NUM_INSTANCES=${OPTARG}
                 ;;
-            p)  ## ARG HELP:  -p: number of parallel instances (default: run all iterations simultaneously)
+            p)  ## ARG HELP:  -p <num>:  number of parallel instances (default: run all iterations simultaneously)
                 NUM_PARALLEL=${OPTARG}
                 ;;
             d)  ## ARG HELP:  -d: dump kubernetes 'job' object to stdout
@@ -144,6 +147,7 @@ function parse_arguments() {
                 display_help
                 exit 0
                 ;;
+                ## ARG HELP:  --: End 'mlaunch' argument processing and pass remainder to container
             \?)
                 echo "Invalid option: -$OPTARG" >&2
                 exit 1
